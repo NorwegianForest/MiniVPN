@@ -1,0 +1,20 @@
+
+---------------------------
+To compile the compile: 
+---------------------------
+$ make 
+
+
+---------------------------
+To run the server:
+---------------------------
+$ sudo ./svpnserver
+
+Note: The server's certificate is ./cert_server/server-cert-new.pem,
+and the common name of the certificate is 'vpnlabserver.com'. 
+
+
+---------------------------
+To run the client:
+---------------------------
+$ sudo ./svpnclient vpnlabserver.com  4433 *username* *password* *ip*
