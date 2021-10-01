@@ -12,11 +12,56 @@
 #include <shadow.h>
 #include <crypt.h>
 
+#define PORT 4433
+#define BUF_LEN 2048
+#define CERT_FILE "./cert_server/server-cert-new.pem"
+#define KEY_FILE "./cert_server/server-key-new.pem"
 #define CHK_SSL(err) if ((err) < 1) { ERR_print_errors_fp(stderr); exit(2); }
 #define CHK_ERR(err,s) if ((err)==-1) { perror(s); exit(1); }
 
-int  setupTCPServer();
-void processRequest(SSL* ssl, int sock, int tunfd);
+int setupTCPServer()
+{
+    struct sockaddr_in sa_server;
+    int listen_sock;
+
+    listen_sock= socket(AF_INET, SOCK_STREAM, 0);
+    CHK_ERR(listen_sock, "socket");
+    memset(&sa_server, 0, sizeof(sa_server));
+    sa_server.sin_family      = AF_INET;
+    sa_server.sin_addr.s_addr = INADDR_ANY;
+    sa_server.sin_port        = htons(PORT);
+    int err = bind(listen_sock, (struct sockaddr*)&sa_server, sizeof(sa_server));
+    CHK_ERR(err, "bind");
+    err = listen(listen_sock, 5);
+    CHK_ERR(err, "listen");
+    return listen_sock;
+}
+
+SSL* setupTLSServer()
+{
+	SSL_METHOD *meth;
+    SSL_CTX *ctx;
+    SSL *ssl;
+    int err;
+
+    // Step 0: OpenSSL library initialization
+    // This step is no longer needed as of version 1.1.0.
+    SSL_library_init();
+    SSL_load_error_strings();
+    SSLeay_add_ssl_algorithms();
+
+    // Step 1: SSL context initialization
+    meth = (SSL_METHOD *)TLSv1_2_method();
+    ctx = SSL_CTX_new(meth);
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+    // Step 2: Set up the server certificate and private key
+    SSL_CTX_use_certificate_file(ctx, CERT_FILE, SSL_FILETYPE_PEM);
+    SSL_CTX_use_PrivateKey_file(ctx, KEY_FILE, SSL_FILETYPE_PEM);
+    // Step 3: Create a new SSL structure for a connection
+    ssl = SSL_new(ctx);
+
+    return ssl;
+}
 
 int createTunDevice() {
    int tunfd;
@@ -26,57 +71,47 @@ int createTunDevice() {
    ifr.ifr_flags = IFF_TUN | IFF_NO_PI;  
 
    tunfd = open("/dev/net/tun", O_RDWR);
-   ioctl(tunfd, TUNSETIFF, &ifr);       
+   int err = ioctl(tunfd, TUNSETIFF, &ifr);
+   CHK_ERR(err, "ioctl");
 
    return tunfd;
 }
 
-typedef struct thread_data{
-    char* pipe_file;
-    SSL *ssl;
-}THDATA,*PTHDATA;
-
-void* listen_tun(void* tunfd)
+int fork_listen_tun(int tunfd)
 {
-    int fd = *((int*) tunfd);
-    while (1)
-    {
-        char buff[2000];
+	if (fork() == 0)
+	{
+		system("sudo ifconfig tun0 192.168.53.1/24 up && sudo sysctl net.ipv4.ip_forward=1");
 
-        bzero(buff, 2000);
-        int len = read(fd, buff, 2000);
-        if (len > 19 && buff[0] == 0x45)
-        {
-            printf("Receive TUN: len = %d | ip.des = 192.168.53.%d\n", len, (int) buff[19]);
-            char pipe_file[10];
-            sprintf(pipe_file, "./pipe/%d", (int) buff[19]);
-            int fd = open(pipe_file, O_WRONLY);
-            if (fd == -1)
-            {
-                printf("File %s is not exist.\n", pipe_file);
-            }
-            else
-            {
-                write(fd, buff, len);
-            }
-        }
-    }
-}
+		int len;
+		do {
+			char buf[BUF_LEN];
+			bzero(buf, BUF_LEN);
+			len = read(tunfd, buf, BUF_LEN);
+			printf("Receive TUN: %d\n", len);
+			if (len >= 20 && ((buf[0] & 0xF0) == 0x40)) // IPv4
+			{
+				printf("Receive TUN IPv4: %d | ip.des = 192.168.53.%d\n", len, (int)buf[19]);
+				char pipe_file[10];
+	            sprintf(pipe_file, "./pipe/%d", (int) buf[19]);
+	            int pipefd = open(pipe_file, O_WRONLY);
+	            if (pipefd == -1)
+	            {
+	                printf("File %s is not exist.\n", pipe_file);
+	            }
+	            else
+	            {
+	                write(pipefd, buf, len);
+	            }
+			}
+		} while (len > 0);
 
-void* listen_pipe(void* threadData)
-{
-    PTHDATA ptd = (PTHDATA) threadData;
-    int pipefd = open(ptd->pipe_file, O_RDONLY);
-    
-    int len;
-    do {
-        char buff[2000];
-        bzero(buff, 2000);
-        len = read(pipefd, buff, 2000);
-        SSL_write(ptd->ssl, buff, len);
-    } while (len > 0);
-    printf("%s read 0 byte. Close connection and remove file.\n", ptd->pipe_file);
-    remove(ptd->pipe_file);
+		return 0;
+	}
+	else
+	{
+		return 1;
+	}
 }
 
 int login(char *user, char *passwd)
@@ -102,126 +137,112 @@ int login(char *user, char *passwd)
     return 1;
 }
 
-int main(){
-    SSL_METHOD *meth;
-    SSL_CTX *ctx;
-    SSL *ssl;
-    int err;
+int fork_listen_pipe(char *pipe_file, SSL *ssl)
+{
+	if (fork() == 0)
+	{
+		int pipefd = open(pipe_file, O_RDONLY);
 
-    // Step 0: OpenSSL library initialization
-    // This step is no longer needed as of version 1.1.0.
-    SSL_library_init();
-    SSL_load_error_strings();
-    SSLeay_add_ssl_algorithms();
+		int len;
+		do {
+			char buf[BUF_LEN];
+			bzero(buf, BUF_LEN);
+			len = read(pipefd, buf, BUF_LEN);
+			SSL_write(ssl, buf, len);
+			printf("Read PIPE: %d\n", len);
+		} while (len > 0);
+		
+		remove(pipe_file);
 
-    // Step 1: SSL context initialization
-    meth = (SSL_METHOD *)TLSv1_2_method();
-    ctx = SSL_CTX_new(meth);
-    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
-    // Step 2: Set up the server certificate and private key
-    SSL_CTX_use_certificate_file(ctx, "./cert_server/server-cert-new.pem", SSL_FILETYPE_PEM);
-    SSL_CTX_use_PrivateKey_file(ctx, "./cert_server/server-key-new.pem", SSL_FILETYPE_PEM);
-    // Step 3: Create a new SSL structure for a connection
-    ssl = SSL_new(ctx);
+		return 0;
+	}
+	else
+	{
+		return 1;
+	}
+}
 
-    struct sockaddr_in sa_client;
-    size_t client_len;
-    int listen_sock = setupTCPServer();
-    // tunnal init, redirect and forward
-    int tunfd = createTunDevice();
-    system("sudo ifconfig tun0 192.168.53.1/24 up && sudo sysctl net.ipv4.ip_forward=1");
-    // pipe folder init
+int main(int argc, char *argv[])
+{
+	// pipe folder init
     system("rm -rf pipe");
     mkdir("pipe", 0666);
 
-    pthread_t listen_tun_thread;
-    pthread_create(&listen_tun_thread, NULL, listen_tun, (void *)&tunfd);
+	int listen_sock = setupTCPServer();
+	SSL *ssl = setupTLSServer();
 
-    while (1)
-    {
-        int sock = accept(listen_sock, (struct sockaddr *)&sa_client, &client_len); // block
-        if (fork() == 0)
-        {   // The child process
-            close(listen_sock);
+	int tunfd = createTunDevice();
+	if (fork_listen_tun(tunfd) == 0) return 0;
 
-            SSL_set_fd(ssl, sock);
+
+	struct sockaddr_in sa_client;
+	int lenaddr = sizeof(struct sockaddr_in *);
+	while (1)
+	{
+		printf("TCP listen\n");
+		int sock = accept(listen_sock, (struct sockaddr *)&sa_client, &lenaddr); // block
+		CHK_ERR(sock, "accept");
+		if (fork() == 0)
+		{
+			close(listen_sock);
+			printf("TCP connect\n");
+
+			SSL_set_fd(ssl, sock);
             int err = SSL_accept(ssl);
             CHK_SSL(err);
             printf("SSL connection established!\n");
 
-            // login messages
-            char user[1024], passwd[1024], last_ip_buff[1024];
-            user[SSL_read(ssl, user, sizeof(user) - 1)] = '\0';
-            passwd[SSL_read(ssl, passwd, sizeof(passwd) - 1)] = '\0';
-            last_ip_buff[SSL_read(ssl, last_ip_buff, sizeof(last_ip_buff) - 1)] = '\0';
+			// login messages
+            char user[BUF_LEN], passwd[BUF_LEN], last_ip_buf[BUF_LEN];
+            user[SSL_read(ssl, user, BUF_LEN)] = '\0';
+            passwd[SSL_read(ssl, passwd, BUF_LEN)] = '\0';
+            last_ip_buf[SSL_read(ssl, last_ip_buf, BUF_LEN)] = '\0';
 
             if (login(user, passwd))
             {
-                printf("Login successful!\n");
-                // check IP and create pipe file
-                char pipe_file[10];
-                sprintf(pipe_file, "./pipe/%s", last_ip_buff);
-                if (mkfifo(pipe_file, 0666) == -1)
-                {
-                    printf("This IP(%s) has been occupied.", last_ip_buff);
-                }
-                else
-                {
-                    pthread_t listen_pipe_thread;
-                    THDATA threadData;
-                    threadData.pipe_file = pipe_file;
-                    threadData.ssl = ssl;
-                    pthread_create(&listen_pipe_thread, NULL, listen_pipe, (void *)&threadData);
-                    processRequest(ssl, sock, tunfd);
-                    pthread_cancel(listen_pipe_thread);
-                    remove(pipe_file);
-                }
+            	printf("Login success!\n");
+
+	            // check IP and create pipe file
+	            char pipe_file[10];
+	            sprintf(pipe_file, "./pipe/%s", last_ip_buf);
+	            if (mkfifo(pipe_file, 0666) == -1)
+	            {
+	                printf("This IP(192.168.53.%s) has been occupied.\n", last_ip_buf);
+	            }
+	            else
+	            {
+	            	if (fork_listen_pipe(pipe_file, ssl) == 0) return 0;
+
+		            /*----------------Receive SSL ------------------------------*/
+					int len;
+					do {
+						char buf[BUF_LEN];
+						len = SSL_read(ssl, buf, BUF_LEN);
+						buf[len] = '\0';
+						write(tunfd, buf, len);
+						printf("Receive SSL: %d\n", len);
+					} while (len > 0);
+
+					remove(pipe_file);
+	            }
             }
             else
             {
-                printf("Login failed!\n");
+            	printf("Login failed!\n");
             }
-            SSL_shutdown(ssl);
-            SSL_free(ssl);
-            close(sock);
-            printf("Close sock and return 0.\n");
-            return 0;
-        }
-        else
-        {   // The parent process
-            close(sock);
-        }
-    }
-}
+			
+			SSL_shutdown(ssl);
+			SSL_free(ssl);
+			close(sock);
+			printf("SSL shutdown.\n");
 
+			return 0;
+		}
+		else
+		{
+			close(sock);
+		}
+	}
 
-int setupTCPServer()
-{
-    struct sockaddr_in sa_server;
-    int listen_sock;
-
-    listen_sock= socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
-    CHK_ERR(listen_sock, "socket");
-    memset(&sa_server, '\0', sizeof(sa_server));
-    sa_server.sin_family      = AF_INET;
-    sa_server.sin_addr.s_addr = INADDR_ANY;
-    sa_server.sin_port        = htons (4433);
-    int err = bind(listen_sock, (struct sockaddr*)&sa_server, sizeof(sa_server));
-    CHK_ERR(err, "bind");
-    err = listen(listen_sock, 5);
-    CHK_ERR(err, "listen");
-    return listen_sock;
-}
-
-void processRequest(SSL* ssl, int sock, int tunfd)
-{
-    int len;
-    do {
-        char buf[1024];
-        len = SSL_read(ssl, buf, sizeof(buf) - 1);
-        write(tunfd, buf, len);
-        buf[len] = '\0';
-        printf("Received SSL: %d\n", len);
-    } while (len > 0);
-    printf("SSL shutdown.\n");
+	return 0;
 }
