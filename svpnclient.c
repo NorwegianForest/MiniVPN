@@ -10,12 +10,15 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/epoll.h>
 
 #define BUF_LEN 2048
+#define MAX_EVENTS 10
 #define CA_DIR "./ca_client"
 #define CHK_SSL(err) if ((err) < 1) { ERR_print_errors_fp(stderr); exit(2); }
 #define CHK_ERR(err,s) if ((err)==-1) { perror(s); exit(1); }
 #define CHK_LEN(len,s) if ((len) < 1) { perror(s); exit(1); }
+#define CHK_EPL(err,s) if ((err)==-1) { perror(s); exit(EXIT_FAILURE); }
 
 int setupTCPClient(const char* hostname, int port)
 {
@@ -127,39 +130,51 @@ int main(int argc, char *argv[])
     sprintf(cmd, "sudo ifconfig tun0 192.168.53.%s/24 up && sudo route add -net 192.168.60.0/24 tun0", last_ip);
     system(cmd);
 
-    fd_set read_set;
-    FD_ZERO(&read_set);
+    struct epoll_event ev, events[MAX_EVENTS];
+    int epollfd = epoll_create(MAX_EVENTS);
+    CHK_EPL(epollfd, "epoll_create");
+
+    ev.events = EPOLLIN;
+    ev.data.fd = sockfd;
+    int ctl = epoll_ctl(epollfd, EPOLL_CTL_ADD, sockfd, &ev);
+    CHK_EPL(ctl, "epoll_ctl");
+
+    ev.data.fd = tunfd;
+    ctl = epoll_ctl(epollfd, EPOLL_CTL_ADD, tunfd, &ev);
+    CHK_EPL(ctl, "epoll_ctl");
 
     while (1)
     {
-        FD_SET(tunfd, &read_set);
-        FD_SET(sockfd, &read_set);
-        int fd = select(tunfd + 1, &read_set, NULL, NULL, NULL);
-        CHK_ERR(fd, "select");
-        if (FD_ISSET(tunfd, &read_set))
+        int nfds = epoll_wait(epollfd, events, MAX_EVENTS, -1);
+        CHK_EPL(nfds, "epoll_wait");
+
+        for (int n = 0; n < nfds; ++n)
         {
-            char buf[BUF_LEN];
-            bzero(buf, BUF_LEN);
-            int len = read(tunfd, buf, BUF_LEN);
-            printf("Receive TUN: %d\n", len);
-            if (len >= 20 && ((buf[0] & 0xF0) == 0x40)) // IPv4
+            if (events[n].data.fd == tunfd)
             {
-                if ((int)buf[15] == atoi(last_ip)) // ip.src == 192.168.53.last_ip
+                char buf[BUF_LEN];
+                bzero(buf, BUF_LEN);
+                int len = read(tunfd, buf, BUF_LEN);
+                printf("Receive TUN: %d\n", len);
+                if (len >= 20 && ((buf[0] & 0xF0) == 0x40)) // IPv4
                 {
-                    printf("SSL write: %d\n", len);
-                    SSL_write(ssl, buf, len);
+                    if ((int)buf[15] == atoi(last_ip)) // ip.src == 192.168.53.last_ip
+                    {
+                        printf("SSL write: %d\n", len);
+                        SSL_write(ssl, buf, len);
+                    }
                 }
+                CHK_LEN(len, "Close TUN.");
             }
-            CHK_LEN(len, "Close TUN.");
-        }
-        if (FD_ISSET(sockfd, &read_set))
-        {
-            /*----------------Receive SSL ------------------------------*/
-            char buf[BUF_LEN];
-            int len = SSL_read(ssl, buf, BUF_LEN);
-            write(tunfd, buf, len);
-            printf("Receive SSL: %d\n", len);
-            CHK_LEN(len, "Close SSL.");
+            else if (events[n].data.fd == sockfd)
+            {
+                /*----------------Receive SSL ------------------------------*/
+                char buf[BUF_LEN];
+                int len = SSL_read(ssl, buf, BUF_LEN);
+                write(tunfd, buf, len);
+                printf("Receive SSL: %d\n", len);
+                CHK_LEN(len, "Close SSL.");
+            }
         }
     }
 
