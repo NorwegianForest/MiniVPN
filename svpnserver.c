@@ -37,12 +37,11 @@ int setupTCPServer()
     return listen_sock;
 }
 
-SSL* setupTLSServer()
+SSL_CTX* setupTLSServer()
 {
-	SSL_METHOD *meth;
+    SSL_METHOD *meth;
     SSL_CTX *ctx;
-    SSL *ssl;
-    int err;
+    //SSL *ssl;
 
     // Step 0: OpenSSL library initialization
     // This step is no longer needed as of version 1.1.0.
@@ -58,60 +57,23 @@ SSL* setupTLSServer()
     SSL_CTX_use_certificate_file(ctx, CERT_FILE, SSL_FILETYPE_PEM);
     SSL_CTX_use_PrivateKey_file(ctx, KEY_FILE, SSL_FILETYPE_PEM);
     // Step 3: Create a new SSL structure for a connection
-    ssl = SSL_new(ctx);
+    //ssl = SSL_new(ctx);
 
-    return ssl;
+    return ctx;
 }
 
 int createTunDevice() {
-   int tunfd;
-   struct ifreq ifr;
-   memset(&ifr, 0, sizeof(ifr));
+    int tunfd;
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
 
-   ifr.ifr_flags = IFF_TUN | IFF_NO_PI;  
+    ifr.ifr_flags = IFF_TUN | IFF_NO_PI;  
 
-   tunfd = open("/dev/net/tun", O_RDWR);
-   int err = ioctl(tunfd, TUNSETIFF, &ifr);
-   CHK_ERR(err, "ioctl");
+    tunfd = open("/dev/net/tun", O_RDWR);
+    int err = ioctl(tunfd, TUNSETIFF, &ifr);
+    CHK_ERR(err, "ioctl");
 
-   return tunfd;
-}
-
-int fork_listen_tun(int tunfd)
-{
-	if (fork() == 0)
-	{
-		system("sudo ifconfig tun0 192.168.53.1/24 up && sudo sysctl net.ipv4.ip_forward=1");
-
-		int len;
-		do {
-			char buf[BUF_LEN];
-			bzero(buf, BUF_LEN);
-			len = read(tunfd, buf, BUF_LEN);
-			printf("Receive TUN: %d\n", len);
-			if (len >= 20 && ((buf[0] & 0xF0) == 0x40)) // IPv4
-			{
-				printf("Receive TUN IPv4: %d | ip.des = 192.168.53.%d\n", len, (int)buf[19]);
-				char pipe_file[10];
-	            sprintf(pipe_file, "./pipe/%d", (int) buf[19]);
-	            int pipefd = open(pipe_file, O_WRONLY);
-	            if (pipefd == -1)
-	            {
-	                printf("File %s is not exist.\n", pipe_file);
-	            }
-	            else
-	            {
-	                write(pipefd, buf, len);
-	            }
-			}
-		} while (len > 0);
-
-		return 0;
-	}
-	else
-	{
-		return 1;
-	}
+    return tunfd;
 }
 
 int login(char *user, char *passwd)
@@ -137,112 +99,123 @@ int login(char *user, char *passwd)
     return 1;
 }
 
-int fork_listen_pipe(char *pipe_file, SSL *ssl)
-{
-	if (fork() == 0)
-	{
-		int pipefd = open(pipe_file, O_RDONLY);
-
-		int len;
-		do {
-			char buf[BUF_LEN];
-			bzero(buf, BUF_LEN);
-			len = read(pipefd, buf, BUF_LEN);
-			SSL_write(ssl, buf, len);
-			printf("Read PIPE: %d\n", len);
-		} while (len > 0);
-		
-		remove(pipe_file);
-
-		return 0;
-	}
-	else
-	{
-		return 1;
-	}
-}
-
 int main(int argc, char *argv[])
 {
-	// pipe folder init
-    system("rm -rf pipe");
-    mkdir("pipe", 0666);
+    int listen_sock = setupTCPServer();
+    SSL_CTX *ctx = setupTLSServer();
+    int tunfd = createTunDevice();
 
-	int listen_sock = setupTCPServer();
-	SSL *ssl = setupTLSServer();
+    system("sudo ifconfig tun0 192.168.53.1/24 up && sudo sysctl net.ipv4.ip_forward=1");
 
-	int tunfd = createTunDevice();
-	if (fork_listen_tun(tunfd) == 0) return 0;
+    fd_set read_set;
+    FD_ZERO(&read_set);
 
+    struct sockaddr_in sa_client;
+    int lenaddr = sizeof(struct sockaddr_in *);
 
-	struct sockaddr_in sa_client;
-	int lenaddr = sizeof(struct sockaddr_in *);
-	while (1)
-	{
-		printf("TCP listen\n");
-		int sock = accept(listen_sock, (struct sockaddr *)&sa_client, &lenaddr); // block
-		CHK_ERR(sock, "accept");
-		if (fork() == 0)
-		{
-			close(listen_sock);
-			printf("TCP connect\n");
+    int result, fd, len;
+    int ip_sock_map[256]; // last_ip -> tcp sockfd
+    memset(ip_sock_map, -1, sizeof(int) * 256);
+    int fds[FD_SETSIZE]; // active fds
+    memset(fds, 0, sizeof(int) * FD_SETSIZE);
+    SSL* sock_ssl_map[FD_SETSIZE]; // tcp sockfd -> ssl
 
-			SSL_set_fd(ssl, sock);
-            int err = SSL_accept(ssl);
-            CHK_SSL(err);
-            printf("SSL connection established!\n");
+    while (1)
+    {
+        // Set the concerned fds to select()
+        FD_SET(listen_sock, &read_set);
+        FD_SET(tunfd, &read_set);
+        for (fd = 0; fd < FD_SETSIZE; fd++) if (fds[fd] != 0) {FD_SET(fd, &read_set); printf("fds[%d]=%d\n", fd, fds[fd]);}
 
-			// login messages
-            char user[BUF_LEN], passwd[BUF_LEN], last_ip_buf[BUF_LEN];
-            user[SSL_read(ssl, user, BUF_LEN)] = '\0';
-            passwd[SSL_read(ssl, passwd, BUF_LEN)] = '\0';
-            last_ip_buf[SSL_read(ssl, last_ip_buf, BUF_LEN)] = '\0';
+        result = select(FD_SETSIZE, &read_set, NULL, NULL, NULL);
+        if (result < 1)
+        {
+            perror("select");
+            exit(1);
+        }
 
-            if (login(user, passwd))
+        for (fd = 0; fd < FD_SETSIZE; fd++)
+        {
+            if (FD_ISSET(fd, &read_set)) // fd is ready
             {
-            	printf("Login success!\n");
+                printf("fd: %d\n", fd);
+                if (fd == tunfd) // Receive from TUN and forward to relative SSL connection
+                {
+                    char buf[BUF_LEN];
+                    bzero(buf, BUF_LEN);
+                    len = read(tunfd, buf, BUF_LEN);
+                    printf("Receive TUN: %d\n", len);
+                    if (len >= 20 && ((buf[0] & 0xF0) == 0x40)) // IPv4
+                    {
+                        printf("Receive TUN IPv4: %d | ip.des = 192.168.53.%d\n", len, (int)buf[19]);
+                        int sock = ip_sock_map[(int)buf[19]];
+                        if (sock >= 0)
+                        {
+                            SSL* ssl = sock_ssl_map[sock];
+                            SSL_set_fd(ssl, sock);
+                            SSL_write(ssl, buf, len);
+                        }
+                    }
+                }
+                else if (fd == listen_sock) // Accept TCP/SSL connection and authentication
+                {
+                    int sock = accept(listen_sock, (struct sockaddr *)&sa_client, &lenaddr); // block
+                    CHK_ERR(sock, "accept");
+                    printf("TCP connect\n");
 
-	            // check IP and create pipe file
-	            char pipe_file[10];
-	            sprintf(pipe_file, "./pipe/%s", last_ip_buf);
-	            if (mkfifo(pipe_file, 0666) == -1)
-	            {
-	                printf("This IP(192.168.53.%s) has been occupied.\n", last_ip_buf);
-	            }
-	            else
-	            {
-	            	if (fork_listen_pipe(pipe_file, ssl) == 0) return 0;
+                    SSL* ssl = SSL_new(ctx);
+                    SSL_set_fd(ssl, sock);
+                    int err = SSL_accept(ssl);
+                    CHK_SSL(err);
+                    printf("SSL connection established!\n");
 
-		            /*----------------Receive SSL ------------------------------*/
-					int len;
-					do {
-						char buf[BUF_LEN];
-						len = SSL_read(ssl, buf, BUF_LEN);
-						buf[len] = '\0';
-						write(tunfd, buf, len);
-						printf("Receive SSL: %d\n", len);
-					} while (len > 0);
+                    // login messages
+                    char user[BUF_LEN], passwd[BUF_LEN], last_ip_buf[BUF_LEN];
+                    user[SSL_read(ssl, user, BUF_LEN)] = '\0';
+                    passwd[SSL_read(ssl, passwd, BUF_LEN)] = '\0';
+                    last_ip_buf[SSL_read(ssl, last_ip_buf, BUF_LEN)] = '\0';
 
-					remove(pipe_file);
-	            }
+                    if (login(user, passwd))
+                    {
+                        printf("Login success!\n");
+                        int last_ip = atoi(last_ip_buf);
+                        ip_sock_map[last_ip] = sock;
+                        sock_ssl_map[sock] = ssl;
+                        fds[sock] = 1;
+                    }
+                    else
+                    {
+                        close(sock);
+                        printf("Login failed!\n");
+                    }
+                }
+                else // Common SSL read
+                {
+                    SSL* ssl = sock_ssl_map[fd];
+                    SSL_set_fd(ssl, fd);
+                    char buf[BUF_LEN];
+                    len = SSL_read(ssl, buf, BUF_LEN);
+                    buf[len] = '\0';
+                    printf("Receive SSL: %d\n", len);
+                    if (len == -1)
+                    {
+                        CHK_SSL(len);
+                    }
+                    write(tunfd, buf, len);
+                    if (len < 1) 
+                    {
+                        fds[fd] = 0;
+                        FD_CLR(fd, &read_set);
+                        close(fd);
+                        printf("SSL connection shutdown.\n");
+                    }
+                }
             }
-            else
-            {
-            	printf("Login failed!\n");
-            }
-			
-			SSL_shutdown(ssl);
-			SSL_free(ssl);
-			close(sock);
-			printf("SSL shutdown.\n");
+        }
+    }
 
-			return 0;
-		}
-		else
-		{
-			close(sock);
-		}
-	}
+    //SSL_shutdown(ssl);
+    //SSL_free(ssl);
 
-	return 0;
+    return 0;
 }

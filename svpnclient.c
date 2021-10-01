@@ -10,12 +10,12 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
-#include <signal.h>
 
 #define BUF_LEN 2048
 #define CA_DIR "./ca_client"
 #define CHK_SSL(err) if ((err) < 1) { ERR_print_errors_fp(stderr); exit(2); }
 #define CHK_ERR(err,s) if ((err)==-1) { perror(s); exit(1); }
+#define CHK_LEN(len,s) if ((len) < 1) { perror(s); exit(1); }
 
 int setupTCPClient(const char* hostname, int port)
 {
@@ -71,106 +71,97 @@ SSL* setupTLSClient(const char* hostname)
 
 int createTunDevice()
 {
-	int tunfd, err;
-	struct ifreq ifr;
-	memset(&ifr, 0, sizeof(ifr));
+    int tunfd, err;
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
 
-	ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
-	strncpy(ifr.ifr_name, "tun0", IFNAMSIZ);
+    ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
+    strncpy(ifr.ifr_name, "tun0", IFNAMSIZ);
 
-	if ((tunfd = open("/dev/net/tun", O_RDWR)) < 0)
-	{
-		printf("open tun error. errno = %d\n", errno);
-		return tunfd;
-	}
+    if ((tunfd = open("/dev/net/tun", O_RDWR)) < 0)
+    {
+        printf("open tun error. errno = %d\n", errno);
+        return tunfd;
+    }
 
-	err = ioctl(tunfd, TUNSETIFF, &ifr);
-	CHK_ERR(err, "ioctl");
+    err = ioctl(tunfd, TUNSETIFF, &ifr);
+    CHK_ERR(err, "ioctl");
 
-	return tunfd;
-}
-
-int fork_listen_tun(int tunfd, SSL *ssl, char *last_ip)
-{
-	int child_pid = fork();
-	if (child_pid == 0)
-	{
-		/*----------------Add routing ------------------------------*/
-	    char cmd[100];
-	    sprintf(cmd, "sudo ifconfig tun0 192.168.53.%s/24 up && sudo route add -net 192.168.60.0/24 tun0", last_ip);
-	    system(cmd);
-
-		int len;
-		do {
-			char buf[BUF_LEN];
-			bzero(buf, BUF_LEN);
-			len = read(tunfd, buf, BUF_LEN);
-			printf("Receive TUN: %d\n", len);
-			if (len >= 20 && ((buf[0] & 0xF0) == 0x40)) // IPv4
-			{
-				if ((int)buf[15] == atoi(last_ip)) // ip.src == 192.168.53.last_ip
-				{
-					printf("SSL write: %d\n", len);
-					SSL_write(ssl, buf, len);
-				}
-			}
-		} while (len > 0);
-
-		printf("Stop listen tun.\n");
-
-		return 0;
-	}
-
-	return child_pid;
+    return tunfd;
 }
 
 int main(int argc, char *argv[])
 {
-	if (argc < 6)
-	{
-		printf("Missing args.\n");
-		exit(1);
-	}
+    if (argc < 6)
+    {
+        printf("Missing args.\n");
+        exit(1);
+    }
 
-	char *hostname = argv[1], *username = argv[3], *password = argv[4], *last_ip = argv[5];
-	int port = atoi(argv[2]);
+    char *hostname = argv[1], *username = argv[3], *password = argv[4], *last_ip = argv[5];
+    int port = atoi(argv[2]);
 
-	/*----------------Create a TCP connection ------------------*/
+    /*----------------Create a TCP connection ------------------*/
     int sockfd = setupTCPClient(hostname, port);
+    printf("TCP connect.\n");
 
-	/*----------------TLS initialization -----------------------*/
+    /*----------------TLS initialization -----------------------*/
     SSL *ssl = setupTLSClient(hostname);
 
     /*----------------TLS handshake ----------------------------*/
     SSL_set_fd(ssl, sockfd);
     int err = SSL_connect(ssl);
     CHK_SSL(err);
-    printf("SSL connection is successful\n");
-    printf("SSL connection using %s\n", SSL_get_cipher(ssl));
+    printf("SSL connection is successful. Using %s\n", SSL_get_cipher(ssl));
 
-	/*----------------Authenticating Client by user/passwd ------*/
+    /*----------------Authenticating client by user/passwd -----*/
     SSL_write(ssl, username, strlen(username)); // username
     SSL_write(ssl, password, strlen(password)); // password
     SSL_write(ssl, last_ip, strlen(last_ip)); // local last IP
 
-    /*----------------Fork and listen tun ----------------------*/
+    /*----------------Create TUN -------------------------------*/
     int tunfd = createTunDevice();
-    int child_pid = fork_listen_tun(tunfd, ssl, last_ip);
-    if (child_pid == 0) return 0;
 
-    /*----------------Receive SSL ------------------------------*/
-    int len;
-    do {
-    	char buf[BUF_LEN];
-    	len = SSL_read(ssl, buf, BUF_LEN);
-    	write(tunfd, buf, len);
-    	printf("Receive SSL: %d\n", len);
-    } while (len > 0);
+    /*----------------Add routing ------------------------------*/
+    char cmd[100];
+    sprintf(cmd, "sudo ifconfig tun0 192.168.53.%s/24 up && sudo route add -net 192.168.60.0/24 tun0", last_ip);
+    system(cmd);
 
-    kill(child_pid, SIGKILL);
-    wait(NULL);
+    fd_set read_set;
+    FD_ZERO(&read_set);
 
-	printf("Close connection.\n");
+    while (1)
+    {
+        FD_SET(tunfd, &read_set);
+        FD_SET(sockfd, &read_set);
+        int fd = select(tunfd + 1, &read_set, NULL, NULL, NULL);
+        CHK_ERR(fd, "select");
+        if (FD_ISSET(tunfd, &read_set))
+        {
+            char buf[BUF_LEN];
+            bzero(buf, BUF_LEN);
+            int len = read(tunfd, buf, BUF_LEN);
+            printf("Receive TUN: %d\n", len);
+            if (len >= 20 && ((buf[0] & 0xF0) == 0x40)) // IPv4
+            {
+                if ((int)buf[15] == atoi(last_ip)) // ip.src == 192.168.53.last_ip
+                {
+                    printf("SSL write: %d\n", len);
+                    SSL_write(ssl, buf, len);
+                }
+            }
+            CHK_LEN(len, "Close TUN.");
+        }
+        if (FD_ISSET(sockfd, &read_set))
+        {
+            /*----------------Receive SSL ------------------------------*/
+            char buf[BUF_LEN];
+            int len = SSL_read(ssl, buf, BUF_LEN);
+            write(tunfd, buf, len);
+            printf("Receive SSL: %d\n", len);
+            CHK_LEN(len, "Close SSL.");
+        }
+    }
 
-	return 0;
+    return 0;
 }
